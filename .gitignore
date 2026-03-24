@@ -1,0 +1,24 @@
+# Experiment data (too large for git, keep structure only)
+data/news/*
+data/raw/*
+data/structured/*
+data/figures/*
+!data/**/.gitkeep
+
+# Docs folder (internal, not for repo)
+docs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
