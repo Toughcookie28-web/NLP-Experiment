@@ -3,10 +3,14 @@ data/news/*
 data/raw/*
 data/structured/*
 data/figures/*
+data/test/*
 !data/**/.gitkeep
 
 # Docs folder (internal, not for repo)
 docs/
+
+# Config — use config.example.py as the template, copy to config.py locally
+src/config.py
 
 # Python
 __pycache__/

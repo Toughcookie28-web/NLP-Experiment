@@ -79,9 +79,10 @@ def load_and_validate():
 
     # Null report
     extracted_cols = [
-        "risk_level", "strategic_action", "action_urgency_score",
-        "primary_risk_cited", "reassurance_cited",
-        "unsupported_claim_flag", "unsupported_claim_detail",
+        "risk_rating_score", "strategic_action", "action_urgency",
+        "compliance_refusal_flag", "analysis_primary_focus",
+        "reasoning_basis", "tone_confidence_level", "risk_thesis_hook",
+        "unsupported_financial_claim_flag",
     ]
     print("\nNull counts per extracted field:")
     for col in extracted_cols:
@@ -98,19 +99,19 @@ def load_and_validate():
 
 def compute_flip_rate(df):
     """
-    Flip rate: % of samples where risk_level differs from the mode (most common),
+    Flip rate: % of samples where strategic_action differs from the mode (most common),
     grouped by article × persona × model.
-    Higher = more unstable.
+    Higher = more unstable decision-making across repeated runs.
     """
     print("\n=== Flip Rate ===")
-    df_clean = df.dropna(subset=["risk_level"])
+    df_clean = df.dropna(subset=["strategic_action"])
 
     def flip_rate_group(group):
-        mode = group["risk_level"].mode()
+        mode = group["strategic_action"].mode()
         if mode.empty:
             return np.nan
         modal_value = mode.iloc[0]
-        return (group["risk_level"] != modal_value).mean()
+        return (group["strategic_action"] != modal_value).mean()
 
     result = (
         df_clean
@@ -136,17 +137,18 @@ def compute_flip_rate(df):
 
 def compute_entropy(df):
     """
-    Decision entropy: H = -Σ p(d) log₂ p(d) over risk_level distribution
+    Decision entropy: H = -Σ p(d) log₂ p(d) over strategic_action distribution
     across 20 samples, grouped by article × persona × model.
-    Higher = more spread/uncertain.
+    Higher = more spread/uncertain decision-making.
     """
     print("\n=== Decision Entropy ===")
-    df_clean = df.dropna(subset=["risk_level"])
-    RISK_LEVELS = ["Low", "Medium", "High", "Extreme"]
+    df_clean = df.dropna(subset=["strategic_action"])
+    # All 5 possible strategic_action values — used to build probability vector
+    STRATEGIC_ACTIONS = ["Strong_Buy", "Hold_Monitor", "Reduce_Exposure", "Clear_Short", "Halt_Compliance"]
 
     def group_entropy(group):
-        counts = group["risk_level"].value_counts()
-        probs = np.array([counts.get(lv, 0) for lv in RISK_LEVELS], dtype=float)
+        counts = group["strategic_action"].value_counts()
+        probs = np.array([counts.get(lv, 0) for lv in STRATEGIC_ACTIONS], dtype=float)
         if probs.sum() == 0:
             return np.nan
         probs /= probs.sum()
@@ -175,19 +177,20 @@ def compute_entropy(df):
 
 def compute_conservatism_score(df):
     """
-    Conservatism score: mean action_urgency_score per persona × model.
-    Higher urgency score = more conservative (sell/reduce) response.
+    Conservatism score: mean risk_rating_score per persona × model.
+    Scale: 1 (very bullish) to 5 (existential panic).
+    Higher score = more conservative/bearish outlook induced by the persona.
     """
     print("\n=== Conservatism Score ===")
-    df_clean = df.dropna(subset=["action_urgency_score"])
+    df_clean = df.dropna(subset=["risk_rating_score"])
     df_clean = df_clean.copy()
-    df_clean["action_urgency_score"] = pd.to_numeric(
-        df_clean["action_urgency_score"], errors="coerce"
+    df_clean["risk_rating_score"] = pd.to_numeric(
+        df_clean["risk_rating_score"], errors="coerce"
     )
 
     result = (
         df_clean
-        .groupby(["persona_id", "model"])["action_urgency_score"]
+        .groupby(["persona_id", "model"])["risk_rating_score"]
         .mean()
         .unstack("model")
     )
@@ -196,7 +199,7 @@ def compute_conservatism_score(df):
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8, 4))
     sns.heatmap(result, annot=True, fmt=".2f", cmap="RdYlGn_r", ax=ax)
-    ax.set_title("Mean Conservatism Score (Action Urgency) by Persona and Model")
+    ax.set_title("Mean Conservatism Score (Risk Rating 1-5) by Persona and Model")
     fig.tight_layout()
     fig.savefig(FIGURES_DIR / "conservatism_score_heatmap.png", dpi=150)
     plt.close(fig)
@@ -272,14 +275,14 @@ def compute_semantic_variance(df):
 
 def compute_unsupported_claim_rate(df):
     """
-    Unsupported claim rate: % of responses where unsupported_claim_flag = True,
+    Unsupported financial claim rate: % of responses where unsupported_financial_claim_flag = True,
     grouped by persona × model.
-    Higher = this persona makes the model more likely to invent facts.
+    Higher = this persona pushes the model to invent specific financial facts not in the article.
     """
-    print("\n=== Unsupported Claim Rate ===")
-    df_clean = df.dropna(subset=["unsupported_claim_flag"]).copy()
+    print("\n=== Unsupported Financial Claim Rate ===")
+    df_clean = df.dropna(subset=["unsupported_financial_claim_flag"]).copy()
     # Normalize to boolean — extractor may return string "true"/"false"
-    df_clean["hallucination"] = df_clean["unsupported_claim_flag"].apply(
+    df_clean["hallucination"] = df_clean["unsupported_financial_claim_flag"].apply(
         lambda x: str(x).lower() in ("true", "1", "yes")
     )
 
@@ -294,11 +297,42 @@ def compute_unsupported_claim_rate(df):
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(8, 4))
     sns.heatmap(result, annot=True, fmt=".2%", cmap="Reds", ax=ax)
-    ax.set_title("Unsupported Claim Rate by Persona and Model")
+    ax.set_title("Unsupported Financial Claim Rate by Persona and Model")
     fig.tight_layout()
     fig.savefig(FIGURES_DIR / "unsupported_claim_rate_heatmap.png", dpi=150)
     plt.close(fig)
     print("Saved: unsupported_claim_rate_heatmap.png")
+    return result
+
+
+def compute_compliance_refusal_rate(df):
+    """
+    Compliance refusal rate: % of responses where the model refused to give
+    substantive financial advice (triggered safety guardrails), by persona × model.
+    Higher = this persona activates the model's safety training more often.
+    """
+    print("\n=== Compliance Refusal Rate ===")
+    df_clean = df.dropna(subset=["compliance_refusal_flag"]).copy()
+    df_clean["refused"] = df_clean["compliance_refusal_flag"].apply(
+        lambda x: str(x).lower() in ("true", "1", "yes")
+    )
+
+    result = (
+        df_clean
+        .groupby(["persona_id", "model"])["refused"]
+        .mean()
+        .unstack("model")
+    )
+    print(result.to_string())
+
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    sns.heatmap(result, annot=True, fmt=".2%", cmap="Oranges", ax=ax)
+    ax.set_title("Compliance Refusal Rate by Persona and Model")
+    fig.tight_layout()
+    fig.savefig(FIGURES_DIR / "compliance_refusal_rate_heatmap.png", dpi=150)
+    plt.close(fig)
+    print("Saved: compliance_refusal_rate_heatmap.png")
     return result
 
 
@@ -311,6 +345,7 @@ METRICS = [
     compute_conservatism_score,
     compute_semantic_variance,
     compute_unsupported_claim_rate,
+    compute_compliance_refusal_rate,
 ]
 
 

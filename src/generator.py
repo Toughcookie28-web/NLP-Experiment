@@ -63,27 +63,23 @@ def load_articles():
         print("Place articles.jsonl in data/news/ before running.")
         sys.exit(1)
 
-    articles = []
-    required_fields = {"article_id", "article_type", "article_text"}
+    required_fields = {"article_id", "article_text"}
 
-    with open(ARTICLES_PATH) as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as e:
-                print(f"ERROR: Invalid JSON on line {line_num} of articles.jsonl: {e}")
-                sys.exit(1)
-            missing = required_fields - set(record.keys())
-            if missing:
-                print(f"ERROR: Line {line_num} missing fields: {missing}")
-                sys.exit(1)
-            articles.append(record)
+    try:
+        with open(ARTICLES_PATH) as f:
+            articles = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"ERROR: Invalid JSON in articles.json: {e}")
+        sys.exit(1)
+
+    for i, record in enumerate(articles, 1):
+        missing = required_fields - set(record.keys())
+        if missing:
+            print(f"ERROR: Article {i} missing fields: {missing}")
+            sys.exit(1)
 
     if not articles:
-        print("ERROR: articles.jsonl is empty.")
+        print("ERROR: articles.json is empty.")
         sys.exit(1)
 
     print(f"Loaded {len(articles)} articles from {ARTICLES_PATH}")
@@ -181,7 +177,13 @@ def main():
         for article, persona_id, model_id, sample_idx, response_id in work_items:
             # Build messages
             system_prompt = PERSONAS[persona_id]    # empty string for baseline = no system message
-            user_prompt = f"{TASK_INSTRUCTION}\n\n{article['article_text']}"
+            # Prepend headline if present — gives the model the same framing a real analyst has
+            headline = article.get("headline", "")
+            article_block = (
+                f"Headline: {headline}\n\n{article['article_text']}"
+                if headline else article["article_text"]
+            )
+            user_prompt = f"{TASK_INSTRUCTION}\n\n{article_block}"
 
             messages = []
             if system_prompt:
@@ -218,7 +220,6 @@ def main():
             record = {
                 "response_id":        response_id,
                 "article_id":         article["article_id"],
-                "article_type":       article["article_type"],
                 "persona_id":         persona_id,
                 "model":              model_id,
                 "sample_idx":         sample_idx,

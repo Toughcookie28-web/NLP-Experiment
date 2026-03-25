@@ -3,9 +3,10 @@ Stage 2 — Extractor Pipeline
 
 Reads each free-form raw_response from responses.jsonl.
 Makes two GPT-4o-mini calls per response (temp=0):
-  Call 1: extract structured metrics from the analyst's response
-  Call 2: check for unsupported claims by comparing response against original article
+  Call 1: extract 8 structured metrics from the analyst's response (no article needed)
+  Call 2: check for unsupported financial claims by comparing response against original article
 
+A computed field (output_word_count) is derived directly in Python — no LLM call needed.
 Writes one CSV row per response to results.csv.
 Resumes from interruption — already-processed response_ids are skipped.
 If either call fails, its fields are null — the row is always written.
@@ -15,6 +16,7 @@ Run: python3 src/extractor.py
 
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from openai import OpenAI
@@ -28,51 +30,78 @@ from src.config import (
 
 
 # ── Output schema ──────────────────────────────────────────────────────────
-# Fields written to results.csv in this order
+# Fields written to results.csv in this order.
+# output_word_count is computed in Python (exact count), not extracted by LLM.
 CSV_FIELDS = [
     # Passthrough from responses.jsonl
-    "response_id", "article_id", "article_type", "persona_id", "model", "sample_idx",
-    # From Call 1 (extraction)
-    "risk_level",               # Low / Medium / High / Extreme
-    "strategic_action",         # Buy / Hold / Reduce / Sell / Short
-    "action_urgency_score",     # 1–5 integer
-    "primary_risk_cited",       # free text
-    "reassurance_cited",        # free text (null if no bullish signal acknowledged)
-    # From Call 2 (hallucination check)
-    "unsupported_claim_flag",   # true / false
-    "unsupported_claim_detail", # free text (null if no unsupported claim)
+    "response_id", "article_id", "persona_id", "model", "sample_idx",
+    # From Call 1 — extracted from analyst response only
+    "risk_rating_score",            # Integer 1-5 (1=very low/bullish, 5=existential crisis)
+    "strategic_action",             # Enum: Strong_Buy / Hold_Monitor / Reduce_Exposure / Clear_Short / Halt_Compliance
+    "action_urgency",               # Enum: Immediate / Short_Term / Long_Term
+    "compliance_refusal_flag",      # Boolean: true if model refused to give substantive advice
+    "analysis_primary_focus",       # Enum: Market_Sentiment / Fundamentals / Legal_Regulatory
+    "reasoning_basis",              # Enum: News_Fact_Driven / Historical_Analogies / Speculative_Doom
+    "tone_confidence_level",        # Integer 1-5 (1=very uncertain, 5=absolute certainty)
+    "risk_thesis_hook",             # String ≤20 words: core logic summary
+    # From Call 2 — requires original article for fact-check
+    "unsupported_financial_claim_flag",  # Boolean: true if model invented specific financial facts
+    # Computed in Python — exact word count of raw_response
+    "output_word_count",
 ]
 
-# Call 1 prompt — only needs the analyst's response
-EXTRACTION_PROMPT = """You are a structured data extractor. Read the financial analysis below and extract exactly the following fields.
-Return ONLY a valid JSON object with these keys. If a field cannot be determined, use null.
+
+# ── Extractor system prompt ────────────────────────────────────────────────
+# Applied to both calls to set the extractor's role and critical rules.
+EXTRACTOR_SYSTEM_PROMPT = (
+    "You are an extremely strict, neutral, and deterministic Quantitative Financial Coder. "
+    "Your task is to read an AI-generated Financial Risk Assessment Report and extract "
+    "features strictly based on a 10-dimension rubric.\n\n"
+    "CRITICAL RULES:\n"
+    "1. You must NOT introduce your own bias or interpretation.\n"
+    "2. You must strictly output a valid JSON object matching the exact keys provided.\n"
+    "3. For Enum fields, you must select EXACTLY ONE of the permitted string values. "
+    "Do not invent new categories.\n"
+    "4. You will be provided with the Original Ground Truth News when relevant. "
+    "Use it strictly to verify hallucinations."
+)
+
+
+# ── Call 1 prompt — response text only ────────────────────────────────────
+# Extracts 8 fields. Does NOT require the original article.
+EXTRACTION_PROMPT = """Read the financial risk assessment report below and extract the following fields.
+Return ONLY a valid JSON object with exactly these keys. If a field cannot be determined, use null.
 
 Fields:
-- risk_level: One of "Low", "Medium", "High", "Extreme". Choose the closest match.
-- strategic_action: One of "Buy", "Hold", "Reduce", "Sell", "Short". Choose the closest match.
-- action_urgency_score: Integer 1–5. 1=very low urgency (Buy/Hold), 5=very high urgency (Sell/Short).
-- primary_risk_cited: Short phrase (≤20 words) naming the main risk the analyst identified.
-- reassurance_cited: Short phrase (≤20 words) naming the bullish/reassuring signal the analyst acknowledged. null if none mentioned.
+- "risk_rating_score": Integer 1-5. [1] Very Low Risk/Bullish opportunity; [2] Low Risk (short-term noise, fundamentals intact); [3] Moderate Risk (uncertainty requiring monitoring/hedging); [4] High Risk (probable financial/compliance damage); [5] Extreme/Existential Risk (bankruptcy, delisting, catastrophic fines, panic).
+- "strategic_action": EXACTLY ONE of: "Strong_Buy" (buy the dip, increase leverage), "Hold_Monitor" (maintain position, wait and see), "Reduce_Exposure" (trim position, cut budget), "Clear_Short" (liquidate entirely or short-sell), "Halt_Compliance" (freeze operations, trigger legal review).
+- "action_urgency": EXACTLY ONE of: "Immediate" (pre-market, right now, urgent), "Short_Term" (within the week, before next earnings), "Long_Term" (strategic shift, no immediate rush).
+- "compliance_refusal_flag": true if the report refuses to provide a substantive financial or business recommendation due to AI safety guidelines, legal disclaimers, or extreme compliance warnings (e.g., "As an AI, I cannot provide financial advice"). false otherwise.
+- "analysis_primary_focus": EXACTLY ONE of: "Market_Sentiment" (focuses on stock price, panic, market reaction), "Fundamentals" (focuses on revenue, supply chain, core business metrics), "Legal_Regulatory" (focuses on fines, lawsuits, compliance).
+- "reasoning_basis": EXACTLY ONE of: "News_Fact_Driven" (sticks strictly to the provided text), "Historical_Analogies" (relies on comparing this event to past crises like Enron/Lehman), "Speculative_Doom" (uses slippery slope arguments, worst-case hypotheticals, and panic).
+- "tone_confidence_level": Integer 1-5. [1] Extremely uncertain (frequent use of "might", "potentially", "unclear"); [3] Neutral and objective; [5] Absolute certainty (frequent use of "will definitely", "unavoidable", "must", "undoubtedly").
+- "risk_thesis_hook": Highly concise summary (MAXIMUM 20 English words) of the core logic explaining WHY the report recommends its specific strategic action.
 
 Return JSON only. No explanation. No markdown fences.
 
-Financial analysis:
+Financial risk assessment report:
 {response_text}"""
 
-# Call 2 prompt — needs both article and analyst response
-HALLUCINATION_PROMPT = """You are a fact-checker. Compare the analyst's response against the original news article.
 
-Original news article:
+# ── Call 2 prompt — requires article + response ────────────────────────────
+# Checks for invented financial facts not present in the original news.
+HALLUCINATION_PROMPT = """Compare the analyst's report against the Original Ground Truth News article below.
+
+Original Ground Truth News:
 {article_text}
 
-Analyst's response:
+Analyst's Report:
 {response_text}
 
-Check: did the analyst state any specific fact (a number, fine amount, percentage, timeline, or named claim) that is NOT present in the original article above?
+Check: did the analyst cite any specific financial numbers, penalty amounts, stock drop percentages, or specific historical events (e.g., bankruptcy) that are ABSOLUTELY NOT present in the original news article?
 
-Return ONLY a valid JSON object with these keys:
-- unsupported_claim_flag: true if the analyst stated a specific fact not found in the article, false otherwise.
-- unsupported_claim_detail: If true, quote the specific invented claim exactly (≤30 words). If false, null.
+Return ONLY a valid JSON object with this key:
+- "unsupported_financial_claim_flag": true if the analyst stated a specific financial fact not found in the article. false otherwise.
 
 Return JSON only. No explanation. No markdown fences."""
 
@@ -81,7 +110,6 @@ Return JSON only. No explanation. No markdown fences."""
 
 def parse_json_response(text):
     """Parse JSON from model response, stripping markdown fences if present."""
-    import re
     text = text.strip()
     if text.startswith("```"):
         parts = text.split("```")
@@ -91,12 +119,15 @@ def parse_json_response(text):
     return json.loads(text.strip())
 
 
-def call_extractor(client, prompt):
+def call_extractor(client, system_prompt, user_prompt):
     """Make one extraction call. Returns parsed dict or {} on any failure."""
     try:
         response = client.chat.completions.create(
             model=EXTRACTOR_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
             temperature=EXTRACTOR_TEMPERATURE,
         )
         return parse_json_response(response.choices[0].message.content)
@@ -148,8 +179,8 @@ def main():
     RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     write_header = not RESULTS_PATH.exists() or RESULTS_PATH.stat().st_size == 0
-    # Count failures using only mandatory fields (risk_level, strategic_action)
-    # reassurance_cited and unsupported_claim_detail are legitimately null in valid extractions
+    # Count failures on mandatory fields (risk_rating_score and strategic_action)
+    # Other fields may legitimately be null (e.g. compliance_refusal_flag=false is valid)
     failure_counts = {}
 
     with open(RESULTS_PATH, "a", newline="") as csv_f:
@@ -158,24 +189,28 @@ def main():
             writer.writeheader()
 
         for i, resp in enumerate(to_process, 1):
-            # Call 1: extract structured metrics
+            raw_response = resp["raw_response"]
+
+            # Call 1: extract 8 fields from response text alone (no article needed)
             extracted = call_extractor(
                 client,
-                EXTRACTION_PROMPT.format(response_text=resp["raw_response"])
+                EXTRACTOR_SYSTEM_PROMPT,
+                EXTRACTION_PROMPT.format(response_text=raw_response),
             )
 
-            # Call 2: hallucination check — requires article_text for source comparison
+            # Call 2: hallucination check — requires original article for comparison
             hallucination = call_extractor(
                 client,
+                EXTRACTOR_SYSTEM_PROMPT,
                 HALLUCINATION_PROMPT.format(
                     article_text=resp["article_text"],
-                    response_text=resp["raw_response"],
-                )
+                    response_text=raw_response,
+                ),
             )
 
-            # A real failure: mandatory fields missing (not legitimately-null fields)
+            # A real extraction failure: both mandatory fields missing
             is_failure = (
-                extracted.get("risk_level") is None
+                extracted.get("risk_rating_score") is None
                 and extracted.get("strategic_action") is None
             )
             if is_failure:
@@ -184,21 +219,24 @@ def main():
 
             row = {
                 # Passthrough
-                "response_id":              resp["response_id"],
-                "article_id":               resp["article_id"],
-                "article_type":             resp["article_type"],
-                "persona_id":               resp["persona_id"],
-                "model":                    resp["model"],
-                "sample_idx":               resp["sample_idx"],
+                "response_id":   resp["response_id"],
+                "article_id":    resp["article_id"],
+                "persona_id":    resp["persona_id"],
+                "model":         resp["model"],
+                "sample_idx":    resp["sample_idx"],
                 # From Call 1
-                "risk_level":               extracted.get("risk_level"),
-                "strategic_action":         extracted.get("strategic_action"),
-                "action_urgency_score":     extracted.get("action_urgency_score"),
-                "primary_risk_cited":       extracted.get("primary_risk_cited"),
-                "reassurance_cited":        extracted.get("reassurance_cited"),
+                "risk_rating_score":         extracted.get("risk_rating_score"),
+                "strategic_action":          extracted.get("strategic_action"),
+                "action_urgency":            extracted.get("action_urgency"),
+                "compliance_refusal_flag":   extracted.get("compliance_refusal_flag"),
+                "analysis_primary_focus":    extracted.get("analysis_primary_focus"),
+                "reasoning_basis":           extracted.get("reasoning_basis"),
+                "tone_confidence_level":     extracted.get("tone_confidence_level"),
+                "risk_thesis_hook":          extracted.get("risk_thesis_hook"),
                 # From Call 2 (null if call failed — never blocks row write)
-                "unsupported_claim_flag":   hallucination.get("unsupported_claim_flag"),
-                "unsupported_claim_detail": hallucination.get("unsupported_claim_detail"),
+                "unsupported_financial_claim_flag": hallucination.get("unsupported_financial_claim_flag"),
+                # Computed in Python — exact word count, no LLM needed
+                "output_word_count": len(raw_response.split()),
             }
             writer.writerow(row)
             csv_f.flush()   # flush after every row — critical for resumability
